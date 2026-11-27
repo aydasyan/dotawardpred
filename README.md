@@ -66,10 +66,10 @@ py -m venv .venv
 ### 1. Собрать и закэшировать реплеи
 
 ```bat
-.venv\Scripts\python.exe collect_dataset.py --limit 20 --out-dir replays
+.venv\Scripts\python.exe collect_dataset.py --limit 100 --workers 4 --out-dir replays
 ```
 
-Скрипт забирает свежие матчи из OpenDota (`/api/proMatches` или `--source parsed`), скачивает `.dem` через `gem.fetch_replay`, парсит в `.json` кэш и по умолчанию удаляет сырой `.dem` (чтобы не занимать сотни МБ на матч; флаг `--keep-dem` оставляет `.dem`). Реплеи Valve живут ~2 недели.
+Скрипт забирает свежие матчи из OpenDota (`/api/proMatches` или `--source parsed` с пагинацией), скачивает `.dem` через `gem.fetch_replay`, параллельно парсит в `.json` кэш и по умолчанию удаляет сырой `.dem` (флаг `--keep-dem` оставляет `.dem`). Для сбора на нескольких ПК поддерживаются `--dump-ids`, `--ids-file` и `--shard i/N`. Реплеи Valve живут ~2 недели.
 
 Если `.dem` уже скачаны вручную:
 
