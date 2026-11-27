@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from wardpred.config import DEFAULT_CONFIG
 from wardpred.features import (FEATURE_COLS, LocalActivityWindow,
                                _prepare_slot_stream,
-                               build_match_features, xy_to_cell)
+                               build_match_features, build_snapshots, xy_to_cell)
 from wardpred.loader import load_match
 
 
@@ -138,11 +138,31 @@ def test_hero_id_at_snapshot_time():
         assert int(df.iloc[0]["hero_id"]) == 7
 
 
+def test_build_snapshots_without_obs():
+    """Inference-снэпшот в произвольный момент T работает без obs и совпадает с обучением."""
+    match = test_loader_normalizes_and_dedups()
+    train_df = build_match_features(match)
+    # Убираем obs полностью — build_snapshots не должен от них зависеть
+    match_no_obs = type(match)(
+        match.match_id, match.intervals, match.purchases,
+        match.deaths, match.obs.iloc[0:0], match.buildings,
+    )
+    snap = build_snapshots(match_no_obs, np.array([120.0, 200.0]), np.array([7, 7]))
+    assert list(snap.columns) == FEATURE_COLS + ["match_id"]
+    assert len(snap) == 2
+    assert not snap[FEATURE_COLS].isna().any().any()
+    # признаки в моменты 120 и 200 должны точно совпадать с build_match_features
+    for col in FEATURE_COLS:
+        assert np.allclose(snap[col].to_numpy(np.float64),
+                           train_df[col].to_numpy(np.float64)), f"mismatch in {col}"
+
+
 if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore", message=".*флаг 'visible'.*")
     test_cell_mapping()
     test_local_window_boundary()
     test_hero_id_at_snapshot_time()
+    test_build_snapshots_without_obs()
     df = test_features_snapshot()
     print("SMOKE OK:", len(df), "снэпшотов,", df['cell'].nunique(), "клеток")

@@ -38,6 +38,14 @@ FEATURE_COLS: List[str] = [
     "slot", "team", "hero_id",
 ]
 
+# Признаки из combatlog покупок врага: доступны в реплее, но отсутствуют в live
+REPLAY_ONLY_FEATURES: Tuple[str, ...] = (
+    "obs_bought_60s",
+    "obs_bought_120s",
+    "time_since_obs_buy",
+)
+
+_EMPTY_SNAPSHOTS = pd.DataFrame(columns=FEATURE_COLS + ["match_id"])
 _EMPTY_RESULT = pd.DataFrame(columns=FEATURE_COLS + ["cell", "ward_x", "ward_y", "match_id"])
 
 _WARNED = {"perspective": False}
@@ -231,15 +239,25 @@ def _nan_to_marker(values: np.ndarray) -> np.ndarray:
 
 
 # --- главный вход -----------------------------------------------------------------
-def build_match_features(match: MatchEvents,
-                         cfg: WardConfig = DEFAULT_CONFIG) -> pd.DataFrame:
-    """Собрать по одному снэпшоту признаков на каждый obs-событие матча."""
-    obs = _dedup_obs(match.obs)
-    if obs.empty:
-        return _EMPTY_RESULT
-    obs = obs.loc[obs["slot"] >= 0].reset_index(drop=True)
-    if obs.empty:
-        return _EMPTY_RESULT
+def build_snapshots(match: MatchEvents,
+                    times: np.ndarray,
+                    slots: np.ndarray,
+                    cfg: WardConfig = DEFAULT_CONFIG) -> pd.DataFrame:
+    """Собрать снэпшоты признаков в произвольные моменты `times` для слотов `slots`.
+
+    Не использует `match.obs` — подходит как для обучения (вызывается из
+    `build_match_features`), так и для inference в произвольный момент игры `T`.
+    Инвариант анти-утечки: в каждый снэпшот попадают только события с `time <= T`.
+    """
+    obs_t = np.asarray(times, dtype=np.float64)
+    obs_slot = np.asarray(slots, dtype=np.int16)
+    if obs_t.shape != obs_slot.shape or obs_t.ndim != 1:
+        raise ValueError("times и slots должны быть одномерными массивами одинаковой длины")
+    if len(obs_t) == 0:
+        return _EMPTY_SNAPSHOTS.copy()
+    if (obs_slot < 0).any() or (obs_slot > 9).any():
+        raise ValueError("slots должны быть в диапазоне 0..9")
+
     if "visible" not in match.intervals.columns and not _WARNED["perspective"]:
         _WARNED["perspective"] = True
         warnings.warn(
@@ -248,11 +266,7 @@ def build_match_features(match: MatchEvents,
             stacklevel=2,
         )
 
-    n = len(obs)
-    obs_t = obs["time"].to_numpy(np.float64)
-    obs_slot = obs["slot"].to_numpy(np.int16)
-    obs_x = obs["x"].to_numpy(np.float32)
-    obs_y = obs["y"].to_numpy(np.float32)
+    n = len(obs_t)
     support_team = np.where(obs_slot < 5, 0, 1).astype(np.int8)   # слоты 0..4 — Radiant
     our_team = 1 - support_team
 
@@ -397,6 +411,26 @@ def build_match_features(match: MatchEvents,
         "team": support_team,
         "hero_id": hero_id.astype(np.int16),
     })
+    ordered = [c for c in FEATURE_COLS if c in out.columns] + ["match_id"]
+    return out[ordered]
+
+
+def build_match_features(match: MatchEvents,
+                         cfg: WardConfig = DEFAULT_CONFIG) -> pd.DataFrame:
+    """Собрать по одному снэпшоту признаков на каждое obs-событие матча."""
+    obs = _dedup_obs(match.obs)
+    if obs.empty:
+        return _EMPTY_RESULT.copy()
+    obs = obs.loc[(obs["slot"] >= 0) & (obs["slot"] <= 9)].reset_index(drop=True)
+    if obs.empty:
+        return _EMPTY_RESULT.copy()
+
+    obs_t = obs["time"].to_numpy(np.float64)
+    obs_slot = obs["slot"].to_numpy(np.int16)
+    obs_x = obs["x"].to_numpy(np.float32)
+    obs_y = obs["y"].to_numpy(np.float32)
+
+    out = build_snapshots(match, obs_t, obs_slot, cfg)
     out["cell"] = xy_to_cell(obs_x, obs_y, cfg).astype(np.int16)
     out["ward_x"] = obs_x
     out["ward_y"] = obs_y
