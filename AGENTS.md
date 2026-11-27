@@ -13,10 +13,12 @@ DotaWardPrediction — учебный ML-пайплайн на Python для п�
 - `wardpred/config.py` — неизменяемый dataclass `WardConfig` и `DEFAULT_CONFIG`: размеры окон, сетка карты, нормализация координат, предметы вардов, фазы дня/ночи, landmarks и позиции башен. Здесь также перечислены поддерживаемые типы combatlog-событий.
 - `wardpred/loader.py` — потоково читает один JSONL-файл матча в `MatchEvents`: пять pandas DataFrame (`intervals`, `purchases`, `deaths`, `obs`, `buildings`). `match_id` равен имени файла без расширения. Используется `orjson`, а при его отсутствии — стандартный `json`.
 - `wardpred/gem_loader.py` — адаптер gem-dota: `.dem` (через `gem.parse`, медленно) или `.json` (кэш `gem.to_json`) в MatchEvents. Колонка `visible` заполняется authoritative-видимостью реплея (`gem.hero_visibility_at`). Один матч раскрывается в ДВА MatchEvents (по перспективе каждой команды) с ОДИНАКОВЫМ `match_id` — это обязательное условие корректного группового разбиения. Координаты gem (0..32768) переводятся в world units вычитанием 16384 (`GEM_COORD_OFFSET`). Импорт `gem` локальный — пакет опционален для JSONL-пути.
-- `wardpred/features.py` — строит по одному снимку на каждое дедуплицированное `obs`-событие. Содержит `FEATURE_COLS`, преобразование `xy_to_cell`, rolling-окна и last-known-позиции. Итоговый DataFrame имеет порядок колонок `FEATURE_COLS + ["cell", "ward_x", "ward_y", "match_id"]`.
-- `wardpred/model.py` — обучение CatBoost, балансировка классов, кастомная `TopKAccuracy`, сохранение метаданных и функции `predict_heatmap` / `proba_to_heatmap` / `evaluate_quality` (Top-K против baselines на том же сплите, результаты пишутся в мету).
-- `wardpred/__init__.py` — публично экспортирует конфигурацию, загрузчик, построение признаков и `FEATURE_COLS`; функции модели импортируются из `wardpred.model`.
-- `train.py` — CLI: расширяет glob-пути, параллельно или последовательно собирает признаки по файлам (`.jsonl`, `.dem`, `.json`), объединяет их, обучает модель и сохраняет артефакты.
+- `wardpred/features.py` — строит снимки признаков: `build_snapshots` (для произвольных `(time, slot)` без привязки к `obs`, подходит для inference) и `build_match_features` (по одному снимку на каждое дедуплицированное `obs`-событие). Содержит `FEATURE_COLS` (21 признак), `REPLAY_ONLY_FEATURES` (покупки врага), преобразование `xy_to_cell`, rolling-окна и last-known-позиции. Итоговый DataFrame `build_match_features` имеет порядок колонок `FEATURE_COLS + ["cell", "ward_x", "ward_y", "match_id"]`.
+- `wardpred/model.py` — обучение CatBoost (в т.ч. режим `live_only=True` без replay-only признаков), балансировка классов, кастомная `TopKAccuracy`, сохранение метаданных и функции `predict_heatmap` / `proba_to_heatmap` / `evaluate_quality` (Top-K против baselines на том же сплите, включая разбивку по фазам `early`/`mid`/`late`; результаты пишутся в мету).
+- `wardpred/__init__.py` — публично экспортирует конфигурацию, загрузчики, построение признаков (`build_match_features`, `build_snapshots`), `FEATURE_COLS` и `REPLAY_ONLY_FEATURES`; функции модели импортируются из `wardpred.model`.
+- `train.py` — CLI обучения: расширяет glob-пути, параллельно или последовательно собирает признаки по файлам (`.jsonl`, `.dem`, `.json`), объединяет их, обучает модель (поддерживает `--live-only`) и сохраняет артефакты.
+- `predict.py` — CLI inference: строит снэпшот для заданных `--time` и `--slot` через `build_snapshots`, выводит Top-K клеток и ASCII-тепловую карту 8×8 (опционально `--json-out`).
+- `collect_dataset.py` — CLI сбора датасета: OpenDota API (`/api/proMatches` или `/api/parsedMatches`) → `gem.fetch_replay` → `.json` кэш (по умолчанию удаляет `.dem` после кэширования).
 - `tests/test_smoke.py` — синтетический сквозной тест JSONL → загрузка → признаки, без обучения CatBoost.
 - `tests/test_model.py` — синтетический тест весов классов, обучения, предсказания и тепловой карты.
 - `requirements.txt` — единственный файл зависимостей и основной конфигурационный файл окружения.
@@ -48,12 +50,13 @@ python -m pip install -r requirements.txt
 
 - `matches` — обязательный список локальных файлов матчей или glob-шаблонов;
 - `--workers` — число процессов для сборки датасета, по умолчанию `1`; значения больше `1` включают `ProcessPoolExecutor`;
+- `--live-only` — исключить replay-only признаки покупок врага (`REPLAY_ONLY_FEATURES`);
 - `--model-out` — путь CatBoost-модели, по умолчанию `ward_model.cbm`;
 - `--meta-out` — путь JSON-метаданных, по умолчанию `ward_model_meta.json`.
 
-Ошибка обработки одного матча выводится как `[skip]`, а остальные файлы продолжают обрабатываться. Если нет входных путей или ни один матч не дал `obs`-снимков, команда завершается с ошибкой. Метаданные содержат использованные признаки, категориальные колонки, присутствующие классы и `best_iteration`.
+Ошибка обработки одного матча выводится как `[skip]`, а остальные файлы продолжают обрабатываться. Если нет входных путей или ни один матч не дал `obs`-снимков, команда завершается с ошибкой. Метаданные содержат использованные признаки, категориальные колонки, флаг `live_only`, присутствующие классы, `best_iteration` и `metrics` (включая `by_phase`).
 
-Для inference используйте `wardpred.model.predict_heatmap(model, X)`: `X` — DataFrame с одним снимком и обученными feature-колонками. Автономного inference CLI нет.
+Для inference используйте CLI `predict.py <match> --time T --slot S` или программно `wardpred.features.build_snapshots` + `wardpred.model.predict_heatmap(model, X)`.
 
 ## Формат данных и модель
 
