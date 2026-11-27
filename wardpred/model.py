@@ -21,9 +21,16 @@ from catboost import CatBoostClassifier, Pool
 from scipy.ndimage import gaussian_filter
 from sklearn.model_selection import GroupShuffleSplit
 
-from .features import FEATURE_COLS
+from .features import FEATURE_COLS, REPLAY_ONLY_FEATURES
 
 GRID = 8
+
+# Границы фаз игры (секунды) для разбивки метрик качества
+GAME_PHASES: Tuple[Tuple[str, float, float], ...] = (
+    ("early", float("-inf"), 600.0),   # до 10 мин
+    ("mid", 600.0, 1500.0),            # 10–25 мин
+    ("late", 1500.0, float("inf")),    # 25+ мин
+)
 
 # hero_id — ключевая категория: у каждого героя свой стайл вардинга
 CAT_FEATURES = ["slot", "team", "hero_id"]
@@ -95,11 +102,17 @@ def train_ward_classifier(df: pd.DataFrame,
                           group_col: str = "match_id",
                           val_fraction: float = 0.2,
                           seed: int = 2026,
+                          live_only: bool = False,
                           params_override: Optional[dict] = None
                           ) -> Tuple[CatBoostClassifier, dict]:
-    """Сплит ПО МАТЧАМ (не по строкам!) + обучение с весами классов."""
-    feature_cols = [c for c in FEATURE_COLS if c in df.columns]
-    cat_cols = [c for c in CAT_FEATURES if c in df.columns]
+    """Сплит ПО МАТЧАМ (не по строкам!) + обучение с весами классов.
+
+    При live_only=True исключаются replay-only признаки (покупки вардов врага),
+    чтобы модель была переносима на live-данные.
+    """
+    excluded = set(REPLAY_ONLY_FEATURES) if live_only else set()
+    feature_cols = [c for c in FEATURE_COLS if c in df.columns and c not in excluded]
+    cat_cols = [c for c in CAT_FEATURES if c in feature_cols]
     X = df[feature_cols]
     y = df[target_col].astype(int)
 
@@ -126,17 +139,44 @@ def train_ward_classifier(df: pd.DataFrame,
     val_pool = Pool(X.iloc[val_idx], y.iloc[val_idx], cat_features=cat_cols,
                     feature_names=feature_cols)
 
+    early_stopping = params.pop("early_stopping_rounds", 200)
     model = CatBoostClassifier(**params)
-    model.fit(train_pool, eval_set=val_pool,
-              early_stopping_rounds=200, verbose=params.get("metric_period", 100))
+    fit_kwargs = dict(eval_set=val_pool, verbose=params.get("metric_period", 100))
+    if early_stopping is not None:
+        fit_kwargs["early_stopping_rounds"] = early_stopping
+    model.fit(train_pool, **fit_kwargs)
 
     meta = {
         "feature_cols": feature_cols,
         "cat_cols": cat_cols,
+        "live_only": live_only,
         "present_cells": present.tolist(),
         "best_iteration": int(model.get_best_iteration()),
     }
     return model, meta
+
+
+def _subset_metrics(top_labels: np.ndarray, yt: np.ndarray,
+                    freq_order: np.ndarray, ks: Tuple[int, ...],
+                    k_max: int, lx: np.ndarray, ly: np.ndarray,
+                    cfg) -> Dict[str, float]:
+    """Метрики модели и baselines на заданном подмножестве валидации."""
+    from .features import xy_to_cell
+
+    m: Dict[str, float] = {"n_val": int(len(yt))}
+    for k in ks:
+        if k > k_max:
+            continue
+        m[f"top{k}"] = float((top_labels[:, :k] == yt[:, None]).any(axis=1).mean())
+        m[f"uniform_top{k}"] = k / (GRID * GRID)
+        m[f"frequency_top{k}"] = float(np.isin(yt, freq_order[:k]).mean())
+
+    known = (lx != -1.0) & (ly != -1.0)
+    if known.any():
+        pred_cell = xy_to_cell(lx[known], ly[known], cfg)
+        m["last_position_top1"] = float((pred_cell == yt[known]).mean())
+        m["last_position_coverage"] = float(known.mean())
+    return m
 
 
 def evaluate_quality(model: CatBoostClassifier, df: pd.DataFrame,
@@ -146,16 +186,20 @@ def evaluate_quality(model: CatBoostClassifier, df: pd.DataFrame,
     """Top-K accuracy на отложенных матчах + простые baselines (тот же сплит).
 
     Сплит повторяет train_ward_classifier (те же seed/val_fraction), поэтому
-    val-множество совпадает с валидацией обучения. Baselines:
+    val-множество совпадает с валидацией обучения. Дополнительно считается
+    разбивка по фазам игры (`by_phase`: early/mid/late). Baselines:
       * uniform — равномерный выбор из 64 клеток (теоретический уровень K/64);
       * frequency — предсказание самых частых клеток train-части;
       * last_position — клетка последней видимой позиции вардера (Top-1;
         считается только по снэпшотам с известной позицией).
     """
-    from .features import xy_to_cell
     from .config import DEFAULT_CONFIG
 
-    feature_cols = [c for c in FEATURE_COLS if c in df.columns]
+    model_features = getattr(model, "feature_names_", None)
+    if model_features:
+        feature_cols = list(model_features)
+    else:
+        feature_cols = [c for c in FEATURE_COLS if c in df.columns]
     X = df[feature_cols]
     y = df[target_col].astype(int)
 
@@ -167,6 +211,7 @@ def evaluate_quality(model: CatBoostClassifier, df: pd.DataFrame,
     classes = np.asarray(model.classes_)
     y_val = y.iloc[val_idx]
     seen = y_val.isin(classes).to_numpy()
+    val_rows = df.iloc[val_idx][seen]
     X_val = X.iloc[val_idx][seen]
     y_val = y_val[seen]
     n = len(y_val)
@@ -176,31 +221,34 @@ def evaluate_quality(model: CatBoostClassifier, df: pd.DataFrame,
     proba = model.predict_proba(X_val)                # (n, n_present)
     k_max = min(max(ks), proba.shape[1])
     top = np.argpartition(-proba, k_max - 1, axis=1)[:, :k_max]
+    # argpartition не сортирует первые k_max элементов — упорядочиваем по убыванию,
+    # чтобы top_labels[:, :1] строго совпадал с argmax
+    top_scores = np.take_along_axis(proba, top, axis=1)
+    order = np.argsort(-top_scores, axis=1)
+    top = np.take_along_axis(top, order, axis=1)
     top_labels = classes[top]
     yt = y_val.to_numpy()
 
-    metrics: Dict[str, float] = {"n_val": n}
-    for k in ks:
-        if k > k_max:
-            continue
-        metrics[f"top{k}"] = float((top_labels[:, :k] == yt[:, None]).any(axis=1).mean())
-        metrics[f"uniform_top{k}"] = k / (GRID * GRID)
-
     counts = np.bincount(y_train.to_numpy(), minlength=GRID * GRID)
     freq_order = np.argsort(-counts)
-    for k in ks:
-        if k > k_max:
-            continue
-        metrics[f"frequency_top{k}"] = float(
-            np.isin(yt, freq_order[:k]).mean())
 
-    lx = X_val["last_x"].to_numpy(np.float64)
-    ly = X_val["last_y"].to_numpy(np.float64)
-    known = (lx != -1.0) & (ly != -1.0)
-    if known.any():
-        pred_cell = xy_to_cell(lx[known], ly[known], DEFAULT_CONFIG)
-        metrics["last_position_top1"] = float((pred_cell == yt[known]).mean())
-        metrics["last_position_coverage"] = float(known.mean())
+    lx = val_rows["last_x"].to_numpy(np.float64)
+    ly = val_rows["last_y"].to_numpy(np.float64)
+    metrics: Dict[str, object] = _subset_metrics(
+        top_labels, yt, freq_order, ks, k_max, lx, ly, DEFAULT_CONFIG)
+
+    if "game_time" in val_rows.columns:
+        gt = val_rows["game_time"].to_numpy(np.float64)
+        by_phase: Dict[str, dict] = {}
+        for phase_name, lo, hi in GAME_PHASES:
+            mask = (gt >= lo) & (gt < hi)
+            if mask.any():
+                by_phase[phase_name] = _subset_metrics(
+                    top_labels[mask], yt[mask], freq_order, ks, k_max,
+                    lx[mask], ly[mask], DEFAULT_CONFIG)
+        if by_phase:
+            metrics["by_phase"] = by_phase
+
     return metrics
 
 

@@ -14,7 +14,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from wardpred.config import DEFAULT_CONFIG
-from wardpred.features import xy_to_cell
+from wardpred.features import REPLAY_ONLY_FEATURES, xy_to_cell
 from wardpred.model import (TopKAccuracy, build_class_weights, evaluate_quality,
                             predict_heatmap, proba_to_heatmap,
                             train_ward_classifier)
@@ -119,6 +119,54 @@ def test_evaluate_quality():
     assert abs(metrics["uniform_top1"] - 1 / 64) < 1e-9
     # в синтетике вард привязан к позиции: baseline last_position должен работать
     assert metrics["last_position_coverage"] == 1.0
+    # Top-1 должен быть <= Top-3 и строго совпадать с argmax вероятностей
+    assert metrics["top1"] <= metrics["top3"] + 1e-12
+    assert "by_phase" in metrics and set(metrics["by_phase"]) <= {"early", "mid", "late"}
+    assert sum(p["n_val"] for p in metrics["by_phase"].values()) == metrics["n_val"]
+
+
+def test_evaluate_top1_matches_argmax():
+    """Регрессия: evaluate_quality сортирует top-K, так что top1 == argmax."""
+    df = _synthetic_dataset(n_matches=4, n_wards_per_match=30, seed=5)
+    present = np.array([0, 1, 2, 3, 4])
+    df["cell"] = present[np.arange(len(df)) % len(present)]
+
+    class _StubModel:
+        classes_ = present
+        feature_names_ = None
+
+        def predict_proba(self, X):
+            # Ставим максимум в последний столбец (индекс 4), где argpartition
+            # без сортировки мог бы поставить другой элемент на позицию 0
+            p = np.tile(np.array([[0.10, 0.25, 0.20, 0.15, 0.30]]), (len(X), 1))
+            return p
+
+    metrics = evaluate_quality(_StubModel(), df, ks=(1, 3))
+    # Истинный класс 4 встречается в 1/5 строк, argmax всегда предсказывает 4
+    expected_top1 = float((df.loc[df["match_id"] == df["match_id"].unique()[-1], "cell"] == 4).mean())
+    # Проверим точно на том же сплите, что top1 совпадает с argmax
+    assert metrics["top1"] > 0.0
+    # А если передать ks=(1,), результат для top1 должен быть идентичен ks=(1, 3)
+    metrics_k1 = evaluate_quality(_StubModel(), df, ks=(1,))
+    assert abs(metrics["top1"] - metrics_k1["top1"]) < 1e-12
+
+
+def test_live_only_excludes_replay_features():
+    """Режим live_only исключает покупки врага и корректно оценивается в evaluate_quality."""
+    df = _synthetic_dataset()
+    model, meta = train_ward_classifier(
+        df,
+        live_only=True,
+        params_override={
+            "iterations": 40, "learning_rate": 0.3, "depth": 4,
+            "min_data_in_leaf": 1, "metric_period": 20,
+            "early_stopping_rounds": None,
+        },
+    )
+    assert meta["live_only"] is True
+    assert not (set(REPLAY_ONLY_FEATURES) & set(meta["feature_cols"]))
+    metrics = evaluate_quality(model, df)
+    assert metrics["n_val"] > 0
 
 
 if __name__ == "__main__":
@@ -126,4 +174,6 @@ if __name__ == "__main__":
     test_proba_heatmap()
     test_train_and_predict()
     test_evaluate_quality()
+    test_evaluate_top1_matches_argmax()
+    test_live_only_excludes_replay_features()
     print("MODEL SMOKE OK")

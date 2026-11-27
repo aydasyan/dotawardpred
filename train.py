@@ -64,6 +64,8 @@ def main() -> int:
     parser.add_argument("--meta-out", default="ward_model_meta.json")
     parser.add_argument("--workers", type=int, default=1,
                         help="процессы для сборки датасета (1 = последовательно)")
+    parser.add_argument("--live-only", action="store_true",
+                        help="исключить replay-only признаки (покупки вардов врага)")
     args = parser.parse_args()
 
     paths = expand_paths(args.matches)
@@ -96,7 +98,7 @@ def main() -> int:
           f"{dataset['cell'].nunique()} непустых клеток из 64")
     print(dataset["cell"].value_counts().describe().to_string())
 
-    model, meta = train_ward_classifier(dataset)
+    model, meta = train_ward_classifier(dataset, live_only=args.live_only)
 
     metrics = evaluate_quality(model, dataset)
     meta["metrics"] = metrics
@@ -111,6 +113,21 @@ def main() -> int:
             print(f"  Baseline 'клетка последней позиции': "
                   f"{metrics['last_position_top1']:.3f} "
                   f"(покрытие {metrics['last_position_coverage']:.0%})")
+        by_phase = metrics.get("by_phase") or {}
+        if by_phase:
+            print("  По фазам игры:")
+            for phase_name in ("early", "mid", "late"):
+                pm = by_phase.get(phase_name)
+                if not pm:
+                    continue
+                parts = [f"n={pm['n_val']}"]
+                if "top1" in pm:
+                    parts.append(f"Top-1 {pm['top1']:.3f} (freq {pm['frequency_top1']:.3f})")
+                if "top3" in pm:
+                    parts.append(f"Top-3 {pm['top3']:.3f} (freq {pm['frequency_top3']:.3f})")
+                if "last_position_top1" in pm:
+                    parts.append(f"last_pos {pm['last_position_top1']:.3f}")
+                print(f"    {phase_name:5s}: " + " | ".join(parts))
 
     model.save_model(args.model_out)
     save_meta(args.meta_out, meta)
