@@ -1,0 +1,20 @@
+# Виртуальные окружения и кэш Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.idea/
+.vscode/
+
+# Реплеи и кэши парсинга (сотни МБ — хранить локально)
+replays/
+*.dem
+*.dem.bz2
+
+# Артефакты обучения
+*.cbm
+ward_model_meta.json
+ward_model*_meta.json
